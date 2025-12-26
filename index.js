@@ -287,7 +287,7 @@ const connectWithRetry = async (retries = 5, delay = 5000) => {
       await testCloudinary();
 
       httpServer.listen(config.port, '0.0.0.0', () => {
-        const isProduction = config.nodeEnv === 'production';
+        const isProduction = !config.isDevelopment;
 
         console.log(`🚀 Backend running on http://0.0.0.0:${config.port}`);
 
