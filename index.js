@@ -20,6 +20,10 @@ import { safeLog } from './utils/logger.js';
 const app = express();
 const httpServer = createServer(app);
 
+// Trust proxy - Required for Railway/cloud deployments
+// This allows Express to trust the X-Forwarded-For header for accurate client IP detection
+app.set('trust proxy', true);
+
 // Configure Cloudinary
 cloudinary.config(config.cloudinary);
 
