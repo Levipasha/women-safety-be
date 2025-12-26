@@ -287,9 +287,22 @@ const connectWithRetry = async (retries = 5, delay = 5000) => {
       await testCloudinary();
 
       httpServer.listen(config.port, '0.0.0.0', () => {
+        const isProduction = config.nodeEnv === 'production';
+
         console.log(`🚀 Backend running on http://0.0.0.0:${config.port}`);
-        console.log(`   Accessible at http://localhost:${config.port} (local)`);
-        console.log(`   Accessible at http://10.0.2.2:${config.port} (Android emulator)`);
+
+        if (isProduction) {
+          // Production environment (Railway, etc.)
+          const railwayUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+            ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+            : 'https://women-safety-be-production.up.railway.app';
+          console.log(`   🌍 Production URL: ${railwayUrl}`);
+        } else {
+          // Development environment
+          console.log(`   Accessible at http://localhost:${config.port} (local)`);
+          console.log(`   Accessible at http://10.0.2.2:${config.port} (Android emulator)`);
+        }
+
         console.log(`🔌 WebSocket server ready for real-time updates`);
       });
       return;
