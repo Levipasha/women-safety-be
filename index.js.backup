@@ -1,0 +1,1489 @@
+import bcrypt from 'bcryptjs';
+import { v2 as cloudinary } from 'cloudinary';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import express from 'express';
+import { createServer } from 'http';
+import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
+import morgan from 'morgan';
+import multer from 'multer';
+import path from 'path';
+import { Server } from 'socket.io';
+import url from 'url';
+import { EmergencyImage } from './models/EmergencyImage.js';
+
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+
+// Load environment variables from backend/.env only
+dotenv.config({ path: path.join(__dirname, '.env') });
+
+const app = express();
+const httpServer = createServer(app);
+
+// Get allowed origins from environment variable
+const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000', 'http://localhost:19006'];
+
+const io = new Server(httpServer, {
+  cors: {
+    origin: allowedOrigins,
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
+const PORT = process.env.PORT || 4000;
+const MONGODB_URI = process.env.MONGODB_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+// Validate required environment variables
+const requiredEnvVars = {
+  MONGODB_URI: process.env.MONGODB_URI,
+  JWT_SECRET: process.env.JWT_SECRET,
+  CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
+  CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY,
+  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET,
+};
+
+const missingVars = Object.entries(requiredEnvVars)
+  .filter(([key, value]) => !value)
+  .map(([key]) => key);
+
+if (missingVars.length > 0) {
+  console.error('❌ Missing required environment variables:');
+  missingVars.forEach(varName => console.error(`   - ${varName}`));
+  console.error('\nPlease set these in your .env file. See .env.example for reference.');
+  process.exit(1);
+}
+
+// Validate JWT_SECRET is not the default insecure value
+if (JWT_SECRET === 'dev-secret-change-me' || JWT_SECRET.length < 32) {
+  console.error('❌ JWT_SECRET must be set to a strong value (minimum 32 characters)');
+  console.error('   Please generate a secure random string for JWT_SECRET in your .env file');
+  process.exit(1);
+}
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: requiredEnvVars.CLOUDINARY_CLOUD_NAME,
+  api_key: requiredEnvVars.CLOUDINARY_API_KEY,
+  api_secret: requiredEnvVars.CLOUDINARY_API_SECRET,
+});
+
+// Test Cloudinary connection function
+const testCloudinary = async () => {
+  try {
+    await cloudinary.api.ping();
+    console.log('✅ Cloudinary connected');
+  } catch (error) {
+    console.error('❌ Cloudinary connection error:', error.message);
+    console.log('⚠️  Cloudinary uploads may fail. Please check your credentials.');
+  }
+};
+
+// Store connected users: userId -> socketId
+const connectedUsers = new Map();
+
+// Logging utility to sanitize sensitive data
+const sanitizeUserId = (userId) => {
+  if (!userId) return 'unknown';
+  const str = userId.toString();
+  // Show first 8 chars only for logging purposes
+  return str.length > 8 ? `${str.substring(0, 8)}...` : str;
+};
+
+const sanitizeAccountId = (accountId) => {
+  if (!accountId) return 'unknown';
+  // Show first 4 chars only
+  return accountId.length > 4 ? `${accountId.substring(0, 4)}...` : accountId;
+};
+
+// Safe logger that sanitizes sensitive data
+const safeLog = {
+  info: (message, data = {}) => {
+    const sanitized = { ...data };
+    if (sanitized.userId) sanitized.userId = sanitizeUserId(sanitized.userId);
+    if (sanitized.accountId) sanitized.accountId = sanitizeAccountId(sanitized.accountId);
+    if (sanitized.user) sanitized.user = { ...sanitized.user, _id: sanitizeUserId(sanitized.user._id) };
+    console.log(message, Object.keys(sanitized).length > 0 ? sanitized : '');
+  },
+  error: (message, error) => {
+    // Don't log full error objects that might contain sensitive data
+    const safeError = error instanceof Error 
+      ? { message: error.message, name: error.name }
+      : error;
+    console.error(message, safeError);
+  },
+  warn: (message, data = {}) => {
+    const sanitized = { ...data };
+    if (sanitized.userId) sanitized.userId = sanitizeUserId(sanitized.userId);
+    if (sanitized.accountId) sanitized.accountId = sanitizeAccountId(sanitized.accountId);
+    console.warn(message, Object.keys(sanitized).length > 0 ? sanitized : '');
+  },
+};
+
+// Middleware - CORS configuration
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Enhanced request logging with morgan
+// 'combined' format includes more details than 'dev'
+// In production, consider using a structured format or JSON logger
+const morganFormat = process.env.NODE_ENV === 'production' ? 'combined' : 'dev';
+app.use(morgan(morganFormat, {
+  // Skip logging for health checks to reduce noise
+  skip: (req) => req.path === '/api/health' || req.path === '/health',
+}));
+
+// Rate limiting - Basic implementation (for production, use Redis-based rate limiting)
+// Install: npm install express-rate-limit
+let authLimiter = (req, res, next) => next(); // Default: no rate limiting
+let apiLimiter = (req, res, next) => next(); // Default: no rate limiting
+
+try {
+  // Dynamic import for ES modules
+  const rateLimitModule = await import('express-rate-limit');
+  const rateLimit = rateLimitModule.default || rateLimitModule;
+  
+  // General API rate limiter
+  apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // 100 requests per window
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+  // Auth endpoints rate limiter (stricter)
+  authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 5, // 5 requests per window for auth endpoints
+    message: 'Too many login attempts, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  
+  // Apply general rate limiting to all API routes
+  app.use('/api/', apiLimiter);
+  
+  console.log('✅ Rate limiting enabled');
+} catch (error) {
+  console.warn('⚠️  express-rate-limit not installed. Rate limiting disabled.');
+  console.warn('   Install with: npm install express-rate-limit');
+  console.warn('   For production, consider Redis-based rate limiting.');
+}
+
+// Configure multer for file uploads (in-memory storage for base64)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+});
+
+// Simple Alert model (minimal example)
+const alertSchema = new mongoose.Schema(
+  {
+    message: { type: String, required: true },
+    location: { type: Object },
+  },
+  { timestamps: true }
+);
+
+const Alert = mongoose.model('Alert', alertSchema);
+
+// Generate account ID: name + 4 random characters
+const generateAccountId = (name) => {
+  const cleanName = name.trim().replace(/\s+/g, '').toLowerCase();
+  const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*';
+  let randomPart = '';
+  for (let i = 0; i < 4; i++) {
+    randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return cleanName + randomPart;
+};
+
+// User model
+const userSchema = new mongoose.Schema(
+  {
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    passwordHash: { type: String, required: true },
+    name: { type: String, required: true, trim: true },
+    accountId: { type: String, required: true, unique: true, uppercase: true },
+    displayName: { type: String, trim: true },
+    parentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // If set, this user is a child
+    children: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // Array of child user IDs
+    currentLocation: {
+      latitude: { type: Number },
+      longitude: { type: Number },
+      address: { type: String },
+      timestamp: { type: Date },
+    },
+    isAppEnabled: { type: Boolean, default: true }, // App toggle state
+    activeJourney: {
+      isActive: { type: Boolean, default: false },
+      from: {
+        name: { type: String },
+        address: { type: String },
+        coordinates: {
+          lat: { type: Number },
+          lng: { type: Number },
+        },
+      },
+      to: {
+        name: { type: String },
+        address: { type: String },
+        coordinates: {
+          lat: { type: Number },
+          lng: { type: Number },
+        },
+      },
+      selectedRoutePath: [[Number]], // Array of [lat, lng] coordinates
+      deviationDetected: { type: Boolean, default: false },
+      deviationAlertSent: { type: Boolean, default: false },
+      deviationAlertTime: { type: Date },
+      startedAt: { type: Date },
+    },
+    emergencyRecordings: [
+      {
+        audioUrl: { type: String }, // Cloudinary URL
+        cloudinaryPublicId: { type: String },
+        timestamp: { type: String },
+        duration: { type: Number }, // Duration in seconds
+        fileSize: { type: Number }, // File size in bytes
+      },
+    ],
+  },
+  { timestamps: true, collection: 'users' } // ensure documents are stored in the "users" collection only
+);
+
+// Add indexes for frequently queried fields to improve query performance
+userSchema.index({ email: 1 });
+userSchema.index({ accountId: 1 });
+userSchema.index({ parentId: 1 });
+userSchema.index({ 'currentLocation.latitude': 1, 'currentLocation.longitude': 1 });
+userSchema.index({ 'activeJourney.isActive': 1 });
+
+const User = mongoose.model('User', userSchema);
+
+const signToken = (userId) =>
+  jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '7d' });
+
+// WebSocket authentication middleware
+const authenticateSocket = async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    if (!token) {
+      return next(new Error('Authentication error: No token provided'));
+    }
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.sub);
+    if (!user) {
+      return next(new Error('Authentication error: User not found'));
+    }
+    
+    socket.userId = user._id.toString();
+    socket.user = user;
+    next();
+  } catch (err) {
+    next(new Error('Authentication error: Invalid token'));
+  }
+};
+
+// WebSocket connection handling
+io.use(authenticateSocket);
+
+io.on('connection', (socket) => {
+  const userId = socket.userId;
+  connectedUsers.set(userId, socket.id);
+  safeLog.info(`[WebSocket] User connected`, { userId, socketId: socket.id });
+  
+  // Join user's room for targeted updates
+  socket.join(`user:${userId}`);
+  
+  // Join parent's room if user is a child (for receiving parent updates)
+  if (socket.user.parentId) {
+    const parentIdStr = socket.user.parentId.toString();
+    socket.join(`parent:${parentIdStr}`);
+    safeLog.info(`[WebSocket] Child joined parent room`, { userId, parentId: parentIdStr });
+  }
+  
+  // Join children's rooms if user is a parent (for sending updates to children)
+  if (socket.user.children && socket.user.children.length > 0) {
+    socket.user.children.forEach((childId) => {
+      const childIdStr = childId.toString();
+      socket.join(`child:${childIdStr}`);
+    });
+    safeLog.info(`[WebSocket] Parent joined child rooms`, { userId, childrenCount: socket.user.children.length });
+  }
+  
+  // IMPORTANT: Every user should join their own child room
+  // This ensures parent can send updates to this child via child:${userId}
+  socket.join(`child:${userId}`);
+  
+  socket.on('disconnect', () => {
+    connectedUsers.delete(userId);
+    safeLog.info(`[WebSocket] User disconnected`, { userId });
+  });
+});
+
+// Input validation helpers
+const validateEmail = (email) => {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+};
+
+const validatePassword = (password) => {
+  // Minimum 8 characters, at least one letter and one number
+  if (password.length < 8) {
+    return { valid: false, error: 'Password must be at least 8 characters long' };
+  }
+  if (!/[a-zA-Z]/.test(password)) {
+    return { valid: false, error: 'Password must contain at least one letter' };
+  }
+  if (!/[0-9]/.test(password)) {
+    return { valid: false, error: 'Password must contain at least one number' };
+  }
+  return { valid: true };
+};
+
+const sanitizeString = (str) => {
+  if (typeof str !== 'string') return '';
+  return str.trim().replace(/[<>]/g, '');
+};
+
+const validateCoordinates = (lat, lng) => {
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return false;
+  }
+  return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+};
+
+// Middleware to verify JWT token
+const authenticate = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+    const token = authHeader.substring(7);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.sub);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Auth routes (with rate limiting)
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    
+    // Validate required fields
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: 'Email, password, and name are required' });
+    }
+    
+    // Validate email format
+    if (!validateEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    // Validate password strength
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.error });
+    }
+    
+    // Sanitize name
+    const sanitizedName = sanitizeString(name);
+    if (!sanitizedName) {
+      return res.status(400).json({ error: 'Name cannot be empty' });
+    }
+    
+    const existing = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existing) {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
+    
+    // Generate unique account ID
+    let accountId;
+    let isUnique = false;
+    let attempts = 0;
+    while (!isUnique && attempts < 10) {
+      accountId = generateAccountId(name).toUpperCase();
+      const existingAccount = await User.findOne({ accountId });
+      if (!existingAccount) {
+        isUnique = true;
+      }
+      attempts++;
+    }
+    
+    if (!isUnique) {
+      return res.status(500).json({ error: 'Failed to generate unique account ID. Please try again.' });
+    }
+    
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await User.create({ 
+      email: email.toLowerCase().trim(), 
+      passwordHash, 
+      name: sanitizedName,
+      accountId 
+    });
+    const token = signToken(user._id.toString());
+    res.status(201).json({ 
+      token, 
+      user: { 
+        id: user._id, 
+        email: user.email, 
+        name: user.name,
+        accountId: user.accountId 
+      } 
+    });
+  } catch (err) {
+    safeLog.error('Error in register', err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    
+    // Validate email format
+    if (!validateEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = signToken(user._id.toString());
+    res.json({ 
+      token, 
+      user: { 
+        id: user._id, 
+        email: user.email,
+        name: user.name,
+        accountId: user.accountId,
+        isAppEnabled: user.isAppEnabled !== undefined ? user.isAppEnabled : true
+      } 
+    });
+  } catch (err) {
+    safeLog.error('Error in login', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Health check with comprehensive dependency checks
+app.get('/api/health', async (_req, res) => {
+  const healthStatus = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    dependencies: {},
+  };
+
+  // Check MongoDB connection
+  const dbState = mongoose.connection.readyState;
+  const dbStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+  const dbStatus = dbStates[dbState] || 'unknown';
+  
+  healthStatus.dependencies.mongodb = {
+    status: dbState === 1 ? 'healthy' : 'unhealthy',
+    state: dbStatus,
+    readyState: dbState,
+  };
+
+  // Additional MongoDB connection details
+  if (mongoose.connection.readyState === 1) {
+    try {
+      // Test query to verify database is actually responsive
+      await mongoose.connection.db.admin().ping();
+      healthStatus.dependencies.mongodb.ping = 'ok';
+    } catch (error) {
+      healthStatus.dependencies.mongodb.ping = 'failed';
+      healthStatus.dependencies.mongodb.pingError = error.message;
+      healthStatus.status = 'degraded';
+    }
+  } else {
+    healthStatus.status = 'unhealthy';
+  }
+
+  // Check Cloudinary connection
+  try {
+    await cloudinary.api.ping();
+    healthStatus.dependencies.cloudinary = {
+      status: 'healthy',
+    };
+  } catch (error) {
+    healthStatus.dependencies.cloudinary = {
+      status: 'unhealthy',
+      error: error.message,
+    };
+    healthStatus.status = healthStatus.status === 'unhealthy' ? 'unhealthy' : 'degraded';
+  }
+
+  // Determine overall status code
+  const statusCode = healthStatus.status === 'ok' ? 200 : 
+                     healthStatus.status === 'degraded' ? 200 : 503;
+
+  res.status(statusCode).json(healthStatus);
+});
+
+// Account management routes (parent-child)
+// Add a child account (by account ID)
+app.post('/api/accounts/add', authenticate, async (req, res) => {
+  try {
+    const { accountId, displayName } = req.body;
+    if (!accountId) {
+      return res.status(400).json({ error: 'Account ID is required' });
+    }
+
+    // Find the child user by account ID
+    const childUser = await User.findOne({ accountId: accountId.toUpperCase() });
+    if (!childUser) {
+      return res.status(404).json({ error: 'Account with this ID not found' });
+    }
+
+    // Check if already a child
+    if (childUser.parentId) {
+      return res.status(400).json({ error: 'This account is already linked to another parent' });
+    }
+
+    // Check if trying to add self
+    if (childUser._id.toString() === req.user._id.toString()) {
+      return res.status(400).json({ error: 'Cannot add yourself as a child' });
+    }
+
+    // Link child to parent
+    childUser.parentId = req.user._id;
+    if (displayName) {
+      childUser.displayName = displayName;
+    }
+    await childUser.save();
+
+    // Add to parent's children array if not already there
+    if (!req.user.children.includes(childUser._id)) {
+      req.user.children.push(childUser._id);
+      await req.user.save();
+    }
+
+    res.json({
+      message: 'Child account added successfully',
+      child: {
+        id: childUser._id,
+        name: childUser.name,
+        accountId: childUser.accountId,
+        displayName: childUser.displayName || childUser.name,
+      },
+    });
+  } catch (err) {
+    console.error('Error adding child account', err);
+    res.status(500).json({ error: 'Failed to add child account' });
+  }
+});
+
+// Get all child accounts with their locations
+app.get('/api/accounts/children', authenticate, async (req, res) => {
+  try {
+    const children = await User.find({ parentId: req.user._id })
+      .select('name accountId displayName currentLocation updatedAt isAppEnabled activeJourney')
+      .lean();
+
+    const childrenWithLocation = children.map((child) => ({
+      id: child._id.toString(),
+      name: child.name,
+      accountId: child.accountId,
+      displayName: child.displayName || child.name,
+      location: child.currentLocation || null,
+      lastUpdated: child.currentLocation?.timestamp || child.updatedAt,
+      isAppEnabled: child.isAppEnabled !== undefined ? child.isAppEnabled : true,
+      activeJourney: child.activeJourney || null,
+    }));
+
+    res.json({ children: childrenWithLocation });
+  } catch (err) {
+    console.error('Error fetching children', err);
+    res.status(500).json({ error: 'Failed to fetch children accounts' });
+  }
+});
+
+// Remove a child account
+app.delete('/api/accounts/children/:childId', authenticate, async (req, res) => {
+  try {
+    const { childId } = req.params;
+
+    // Find child by ID and verify it belongs to this parent
+    // This matches the logic used in GET /api/accounts/children
+    const childUser = await User.findOne({ 
+      _id: childId, 
+      parentId: req.user._id 
+    });
+
+    if (!childUser) {
+      return res.status(404).json({ error: 'Child account not found or does not belong to you' });
+    }
+
+    // Remove parent link from child
+    childUser.parentId = null;
+    childUser.displayName = undefined;
+    await childUser.save();
+
+    // Refresh parent user to get latest data
+    const parentUser = await User.findById(req.user._id);
+    if (parentUser) {
+      // Remove child from parent's children array
+      parentUser.children = parentUser.children.filter(
+        (id) => id.toString() !== childId
+      );
+      await parentUser.save();
+    }
+
+    res.json({
+      message: 'Child account removed successfully',
+    });
+  } catch (err) {
+    console.error('Error removing child account', err);
+    res.status(500).json({ error: 'Failed to remove child account' });
+  }
+});
+
+// Update current location (for children to update their location)
+app.put('/api/accounts/location', authenticate, async (req, res) => {
+  try {
+    const { latitude, longitude, address } = req.body;
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+    
+    // Validate coordinates
+    if (!validateCoordinates(latitude, longitude)) {
+      return res.status(400).json({ error: 'Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180' });
+    }
+
+    req.user.currentLocation = {
+      latitude,
+      longitude,
+      address: address || null,
+      timestamp: new Date(),
+    };
+    await req.user.save();
+
+    res.json({
+      message: 'Location updated successfully',
+      location: req.user.currentLocation,
+    });
+  } catch (err) {
+    console.error('Error updating location', err);
+    res.status(500).json({ error: 'Failed to update location' });
+  }
+});
+
+// Start journey (child starts journey from A to B with selected route path)
+app.post('/api/journey/start', authenticate, async (req, res) => {
+  try {
+    const { from, to, selectedRoutePath } = req.body;
+    
+    if (!from || !to || !from.coordinates || !to.coordinates) {
+      return res.status(400).json({ error: 'From and to locations with coordinates are required' });
+    }
+
+    req.user.activeJourney = {
+      isActive: true,
+      from,
+      to,
+      selectedRoutePath: selectedRoutePath || [],
+      deviationDetected: false,
+      deviationAlertSent: false,
+      deviationAlertTime: null,
+      startedAt: new Date(),
+    };
+    await req.user.save();
+
+    // Notify parent via WebSocket
+    if (req.user.parentId) {
+      const parentSocketId = connectedUsers.get(req.user.parentId.toString());
+      if (parentSocketId) {
+        io.to(parentSocketId).emit('child-journey-started', {
+          childId: req.user._id.toString(),
+          childName: req.user.displayName || req.user.name,
+          journey: req.user.activeJourney,
+        });
+        safeLog.info(`[Journey] Notified parent that child started journey`, { childId: req.user._id, parentId: req.user.parentId });
+      }
+    }
+
+    res.json({
+      message: 'Journey started successfully',
+      journey: req.user.activeJourney,
+    });
+  } catch (err) {
+    console.error('Error starting journey', err);
+    res.status(500).json({ error: 'Failed to start journey' });
+  }
+});
+
+// Stop journey (child ends journey)
+app.post('/api/journey/stop', authenticate, async (req, res) => {
+  try {
+    req.user.activeJourney = {
+      isActive: false,
+      from: null,
+      to: null,
+      selectedRoutePath: [],
+      deviationDetected: false,
+      deviationAlertSent: false,
+      deviationAlertTime: null,
+      startedAt: null,
+    };
+    await req.user.save();
+
+    // Notify parent via WebSocket
+    if (req.user.parentId) {
+      const parentSocketId = connectedUsers.get(req.user.parentId.toString());
+      if (parentSocketId) {
+        io.to(parentSocketId).emit('child-journey-stopped', {
+          childId: req.user._id.toString(),
+          childName: req.user.displayName || req.user.name,
+        });
+        safeLog.info(`[Journey] Notified parent that child stopped journey`, { childId: req.user._id, parentId: req.user.parentId });
+      }
+    }
+
+    res.json({
+      message: 'Journey stopped successfully',
+    });
+  } catch (err) {
+    console.error('Error stopping journey', err);
+    res.status(500).json({ error: 'Failed to stop journey' });
+  }
+});
+
+// Respond to deviation alert (child confirms they're okay)
+app.post('/api/journey/deviation-response', authenticate, async (req, res) => {
+  try {
+    const { isOkay } = req.body;
+    
+    if (isOkay) {
+      // Child confirmed they're okay - reset deviation flags
+      req.user.activeJourney.deviationDetected = false;
+      req.user.activeJourney.deviationAlertSent = false;
+      req.user.activeJourney.deviationAlertTime = null;
+      await req.user.save();
+      
+      safeLog.info(`[Journey] Child responded to deviation alert - they're okay`, { userId: req.user._id });
+      
+      res.json({
+        message: 'Response recorded successfully',
+      });
+    } else {
+      res.status(400).json({ error: 'Invalid response' });
+    }
+  } catch (err) {
+    console.error('Error recording deviation response', err);
+    res.status(500).json({ error: 'Failed to record response' });
+  }
+});
+
+// Check route deviation and alert parent if needed
+app.post('/api/journey/check-deviation', authenticate, async (req, res) => {
+  try {
+    const { currentLat, currentLng } = req.body;
+    
+    if (!currentLat || !currentLng) {
+      return res.status(400).json({ error: 'Current location required' });
+    }
+    
+    // Validate coordinates
+    if (!validateCoordinates(currentLat, currentLng)) {
+      return res.status(400).json({ error: 'Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180' });
+    }
+    
+    const journey = req.user.activeJourney;
+    
+    if (!journey || !journey.isActive || !journey.selectedRoutePath || journey.selectedRoutePath.length === 0) {
+      return res.json({ onRoute: true, message: 'No active journey or route path' });
+    }
+    
+    // Calculate minimum distance to route path
+    let minDistance = Infinity;
+    journey.selectedRoutePath.forEach(point => {
+      const distance = calculateDistance(currentLat, currentLng, point[0], point[1]);
+      if (distance < minDistance) {
+        minDistance = distance;
+      }
+    });
+    
+    // Threshold: 200 meters off route
+    const DEVIATION_THRESHOLD = 0.2; // km
+    const isOffRoute = minDistance > DEVIATION_THRESHOLD;
+    
+    console.log(`[Journey] Deviation check - Distance from route: ${(minDistance * 1000).toFixed(0)}m, Off route: ${isOffRoute}`);
+    
+    if (isOffRoute && !journey.deviationAlertSent) {
+      // First time deviation detected - set flag and alert time
+      journey.deviationDetected = true;
+      journey.deviationAlertSent = true;
+      journey.deviationAlertTime = new Date();
+      await req.user.save();
+      
+      safeLog.warn(`[Journey] Child went off route! Alert sent.`, { userId: req.user._id });
+      
+      res.json({
+        onRoute: false,
+        distanceFromRoute: minDistance,
+        alertSent: true,
+        message: 'You seem to have gone off your planned route. Are you okay?'
+      });
+    } else if (isOffRoute && journey.deviationAlertSent) {
+      // Check if alert timeout exceeded (5 minutes)
+      const alertTime = new Date(journey.deviationAlertTime);
+      const now = new Date();
+      const minutesSinceAlert = (now - alertTime) / 1000 / 60;
+      
+      if (minutesSinceAlert > 5 && req.user.parentId) {
+        // Alert parent - no response for 5 minutes
+        const parentSocketId = connectedUsers.get(req.user.parentId.toString());
+        if (parentSocketId) {
+          io.to(parentSocketId).emit('child-deviation-alert', {
+            childId: req.user._id.toString(),
+            childName: req.user.displayName || req.user.name,
+            currentLocation: { lat: currentLat, lng: currentLng },
+            distanceFromRoute: minDistance,
+            timestamp: new Date(),
+          });
+          safeLog.warn(`[Journey] PARENT ALERT! Child off route with no response for 5 minutes`, { userId: req.user._id });
+        }
+        
+        res.json({
+          onRoute: false,
+          distanceFromRoute: minDistance,
+          parentAlerted: true,
+          message: 'Parent has been notified'
+        });
+      } else {
+        res.json({
+          onRoute: false,
+          distanceFromRoute: minDistance,
+          alertPending: true,
+          message: 'Waiting for response'
+        });
+      }
+    } else {
+      res.json({
+        onRoute: true,
+        distanceFromRoute: minDistance,
+        message: 'On route'
+      });
+    }
+  } catch (err) {
+    console.error('Error checking deviation', err);
+    res.status(500).json({ error: 'Failed to check deviation' });
+  }
+});
+
+// Helper function to calculate distance between two points (Haversine formula)
+function calculateDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371; // Earth's radius in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLng/2) * Math.sin(dLng/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c; // Distance in km
+}
+
+// Upload emergency image to Cloudinary and save to MongoDB
+app.post('/api/emergency/upload-image', authenticate, async (req, res) => {
+  try {
+    const { imageBase64, location, triggerType } = req.body;
+    
+    if (!imageBase64) {
+      return res.status(400).json({ error: 'Image data is required' });
+    }
+
+    // Convert base64 to buffer
+    let imageBuffer;
+    try {
+      // Remove data URL prefix if present (data:image/jpeg;base64,)
+      const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      imageBuffer = Buffer.from(base64Data, 'base64');
+    } catch (error) {
+      return res.status(400).json({ error: 'Invalid image data format' });
+    }
+
+    // Upload to Cloudinary
+    let cloudinaryResult;
+    try {
+      safeLog.info(`Uploading image to Cloudinary`, { userId: req.user._id });
+      cloudinaryResult = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+          {
+            folder: 'emergency-images',
+            resource_type: 'image',
+            public_id: `emergency_${req.user._id}_${Date.now()}`,
+          },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        ).end(imageBuffer);
+      });
+      safeLog.info(`Image uploaded to Cloudinary successfully`);
+    } catch (error) {
+      safeLog.error('Cloudinary upload error', error);
+      return res.status(500).json({ error: 'Failed to upload image to Cloudinary' });
+    }
+
+    // Save image URL link to MongoDB
+    safeLog.info(`Saving image link to MongoDB`, { userId: req.user._id });
+    const emergencyImage = await EmergencyImage.create({
+      userId: req.user._id,
+      imageUrl: cloudinaryResult.secure_url, // Cloudinary link saved here
+      cloudinaryPublicId: cloudinaryResult.public_id,
+      location: location || null,
+      triggerType: triggerType || 'shutdown_attempt',
+      timestamp: new Date(),
+    });
+    safeLog.info(`Image link saved to MongoDB`);
+
+    res.json({
+      success: true,
+      imageUrl: cloudinaryResult.secure_url, // Returns the Cloudinary link
+      imageId: emergencyImage._id,
+      publicId: cloudinaryResult.public_id,
+    });
+  } catch (error) {
+      safeLog.error('Error uploading emergency image', error);
+    res.status(500).json({ error: 'Failed to upload emergency image' });
+  }
+});
+
+// Upload emergency audio recording to Cloudinary and save metadata to user
+app.post('/api/emergency/upload-audio', upload.single('audio'), async (req, res) => {
+  try {
+    safeLog.info('Received audio upload request');
+    
+    const { accountId, timestamp } = req.body;
+    const audioFile = req.file;
+    
+    if (!audioFile) {
+      return res.status(400).json({ error: 'Audio file is required' });
+    }
+    
+    if (!accountId) {
+      return res.status(400).json({ error: 'Account ID is required' });
+    }
+
+    console.log(`📤 Uploading audio (${(audioFile.size / 1024).toFixed(2)} KB) to Cloudinary...`);
+
+    // Upload audio to Cloudinary
+    let cloudinaryResult;
+    try {
+      cloudinaryResult = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+          {
+            folder: 'emergency-audio',
+            resource_type: 'video', // Audio files use 'video' resource type in Cloudinary
+            public_id: `audio_${accountId}_${Date.now()}`,
+            format: 'm4a', // Preserve audio format
+          },
+          (error, result) => {
+            if (error) {
+              console.error('❌ Cloudinary audio upload error:', error);
+              reject(error);
+            } else {
+              resolve(result);
+            }
+          }
+        ).end(audioFile.buffer);
+      });
+      
+      safeLog.info(`Audio uploaded to Cloudinary successfully`);
+    } catch (error) {
+      safeLog.error('Cloudinary audio upload failed', error);
+      return res.status(500).json({ error: 'Failed to upload audio to Cloudinary' });
+    }
+
+    // Find user by accountId
+    const user = await User.findOne({ accountId: accountId.toUpperCase() });
+    if (!user) {
+      safeLog.warn(`User not found for accountId`, { accountId: sanitizeAccountId(accountId) });
+      // Still return success since audio is uploaded to Cloudinary
+      return res.json({
+        success: true,
+        url: cloudinaryResult.secure_url,
+        cloudinaryPublicId: cloudinaryResult.public_id,
+        warning: 'Audio uploaded but user not found in database',
+      });
+    }
+
+    // Save audio metadata to user's emergency recordings array
+    if (!user.emergencyRecordings) {
+      user.emergencyRecordings = [];
+    }
+    
+    user.emergencyRecordings.push({
+      audioUrl: cloudinaryResult.secure_url,
+      cloudinaryPublicId: cloudinaryResult.public_id,
+      timestamp: timestamp || new Date().toISOString(),
+      duration: cloudinaryResult.duration || 0,
+      fileSize: audioFile.size,
+    });
+    
+    // Keep only last 50 recordings to prevent bloat
+    if (user.emergencyRecordings.length > 50) {
+      user.emergencyRecordings = user.emergencyRecordings.slice(-50);
+    }
+    
+    await user.save();
+    
+    safeLog.info(`Audio metadata saved`, { accountId: sanitizeAccountId(user.accountId), recordingsCount: user.emergencyRecordings.length });
+
+    res.json({
+      success: true,
+      url: cloudinaryResult.secure_url,
+      cloudinaryPublicId: cloudinaryResult.public_id,
+      duration: cloudinaryResult.duration,
+    });
+  } catch (error) {
+    console.error('❌ Error uploading emergency audio:', error);
+    res.status(500).json({ error: 'Failed to upload emergency audio' });
+  }
+});
+
+// Get emergency images for a user
+app.get('/api/emergency/images', authenticate, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100); // Max 100 per page
+    const skip = (page - 1) * limit;
+
+    const images = await EmergencyImage.find({ userId: req.user._id })
+      .sort({ timestamp: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+    
+    const total = await EmergencyImage.countDocuments({ userId: req.user._id });
+    
+    res.json({ 
+      images,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page * limit < total,
+        hasPrevPage: page > 1,
+      },
+    });
+  } catch (error) {
+    safeLog.error('Error fetching emergency images', error);
+    res.status(500).json({ error: 'Failed to fetch emergency images' });
+  }
+});
+
+// Find nearby users within radius (in km)
+app.post('/api/nearby/users', authenticate, async (req, res) => {
+  try {
+    const { latitude, longitude, radiusKm = 5 } = req.body; // Default 5km radius
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+    
+    // Validate coordinates
+    if (!validateCoordinates(latitude, longitude)) {
+      return res.status(400).json({ error: 'Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180' });
+    }
+    
+    // Validate radius
+    if (typeof radiusKm !== 'number' || radiusKm <= 0 || radiusKm > 100) {
+      return res.status(400).json({ error: 'Radius must be a number between 0 and 100 km' });
+    }
+
+    if (!req.user.currentLocation || !req.user.currentLocation.latitude) {
+      return res.status(400).json({ error: 'Your location is not available. Please enable location updates.' });
+    }
+
+    // Find all users with active locations and app enabled
+    const allUsers = await User.find({
+      _id: { $ne: req.user._id }, // Exclude self
+      isAppEnabled: true,
+      'currentLocation.latitude': { $exists: true },
+      'currentLocation.longitude': { $exists: true },
+    }).select('name accountId currentLocation');
+
+    // Calculate distance for each user
+    const nearbyUsers = [];
+    for (const user of allUsers) {
+      if (user.currentLocation && user.currentLocation.latitude) {
+        const distance = calculateDistance(
+          latitude,
+          longitude,
+          user.currentLocation.latitude,
+          user.currentLocation.longitude
+        );
+
+        if (distance <= radiusKm) {
+          nearbyUsers.push({
+            userId: user._id.toString(),
+            name: user.name,
+            accountId: user.accountId,
+            distance: distance,
+            location: {
+              latitude: user.currentLocation.latitude,
+              longitude: user.currentLocation.longitude,
+              address: user.currentLocation.address || null,
+            },
+          });
+        }
+      }
+    }
+
+    // Sort by distance (closest first)
+    nearbyUsers.sort((a, b) => a.distance - b.distance);
+
+    safeLog.info(`Found nearby users`, { count: nearbyUsers.length, radiusKm, userId: req.user._id });
+
+    res.json({
+      nearbyUsers,
+      count: nearbyUsers.length,
+      radiusKm,
+    });
+  } catch (error) {
+    safeLog.error('Error finding nearby users', error);
+    res.status(500).json({ error: 'Failed to find nearby users' });
+  }
+});
+
+// Broadcast SOS alert to nearby users
+app.post('/api/emergency/sos-broadcast', authenticate, async (req, res) => {
+  try {
+    const { latitude, longitude, address } = req.body;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Location is required for SOS broadcast' });
+    }
+    
+    // Validate coordinates
+    if (!validateCoordinates(latitude, longitude)) {
+      return res.status(400).json({ error: 'Invalid coordinates. Latitude must be between -90 and 90, longitude between -180 and 180' });
+    }
+
+    const radiusKm = 5; // 5km radius for nearby users
+    const alertId = `sos_${req.user._id}_${Date.now()}`;
+
+    // Find nearby users
+    const allUsers = await User.find({
+      _id: { $ne: req.user._id },
+      isAppEnabled: true,
+      'currentLocation.latitude': { $exists: true },
+      'currentLocation.longitude': { $exists: true },
+    }).select('name accountId currentLocation _id');
+
+    const nearbyUserIds = [];
+    const alertData = {
+      alertId,
+      userId: req.user._id.toString(),
+      userName: req.user.name,
+      accountId: req.user.accountId,
+      location: {
+        latitude,
+        longitude,
+        address: address || req.user.currentLocation?.address || null,
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    // Calculate distance and send alert to nearby users
+    for (const user of allUsers) {
+      if (user.currentLocation && user.currentLocation.latitude) {
+        const distance = calculateDistance(
+          latitude,
+          longitude,
+          user.currentLocation.latitude,
+          user.currentLocation.longitude
+        );
+
+        if (distance <= radiusKm) {
+          nearbyUserIds.push(user._id.toString());
+          
+          // Send WebSocket alert to nearby user
+          const alertWithDistance = {
+            ...alertData,
+            distance: parseFloat(distance.toFixed(2)),
+          };
+          
+          // Emit to user's room
+          io.to(`user:${user._id}`).emit('nearby-sos-alert', alertWithDistance);
+          safeLog.info(`SOS alert sent to nearby user`, { distance: distance.toFixed(2), recipientName: user.name });
+        }
+      }
+    }
+
+    safeLog.info(`SOS broadcast complete`, { notifiedCount: nearbyUserIds.length });
+
+    res.json({
+      success: true,
+      alertId,
+      nearbyUsersNotified: nearbyUserIds.length,
+      nearbyUserIds,
+    });
+  } catch (error) {
+    safeLog.error('Error broadcasting SOS', error);
+    res.status(500).json({ error: 'Failed to broadcast SOS alert' });
+  }
+});
+
+// Update app enabled state
+app.put('/api/accounts/app-state', authenticate, async (req, res) => {
+  try {
+    const { isAppEnabled } = req.body;
+    if (typeof isAppEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'isAppEnabled must be a boolean' });
+    }
+
+    req.user.isAppEnabled = isAppEnabled;
+    await req.user.save();
+
+    // Broadcast app state change via WebSocket to all connected clients
+    // Notify the user's own devices
+    io.to(`user:${req.user._id}`).emit('app-state-changed', {
+      userId: req.user._id.toString(),
+      isAppEnabled: req.user.isAppEnabled,
+    });
+    
+    // If user is a child, notify parent
+    if (req.user.parentId) {
+      io.to(`parent:${req.user.parentId}`).emit('child-app-state-changed', {
+        childId: req.user._id.toString(),
+        isAppEnabled: req.user.isAppEnabled,
+      });
+    }
+    
+    // If user is a parent, notify all children
+    if (req.user.children && req.user.children.length > 0) {
+      safeLog.info(`Broadcasting to children`, { childrenCount: req.user.children.length });
+      req.user.children.forEach((childId) => {
+        const childIdStr = childId.toString();
+        const parentIdStr = req.user._id.toString();
+        
+        // Send to child's room
+        io.to(`child:${childIdStr}`).emit('parent-app-state-changed', {
+          parentId: parentIdStr,
+          isAppEnabled: req.user.isAppEnabled,
+        });
+        
+        // Also send to user room as backup
+        io.to(`user:${childIdStr}`).emit('parent-app-state-changed', {
+          parentId: parentIdStr,
+          isAppEnabled: req.user.isAppEnabled,
+        });
+        
+        safeLog.info(`Sent parent-app-state-changed to child`, { childId: childIdStr });
+      });
+    }
+
+    safeLog.info(`Broadcasted app state change`, { userId: req.user._id, isAppEnabled });
+
+    res.json({
+      message: 'App state updated successfully',
+      isAppEnabled: req.user.isAppEnabled,
+    });
+  } catch (err) {
+    console.error('Error updating app state', err);
+    res.status(500).json({ error: 'Failed to update app state' });
+  }
+});
+
+// Get app enabled state
+app.get('/api/accounts/app-state', authenticate, async (req, res) => {
+  try {
+    res.json({
+      isAppEnabled: req.user.isAppEnabled !== undefined ? req.user.isAppEnabled : true,
+    });
+  } catch (err) {
+    console.error('Error fetching app state', err);
+    res.status(500).json({ error: 'Failed to fetch app state' });
+  }
+});
+
+// Create alert (requires authentication)
+app.post('/api/alerts', authenticate, async (req, res) => {
+  try {
+    const alert = new Alert(req.body);
+    await alert.save();
+    res.status(201).json(alert);
+  } catch (err) {
+    console.error('Error creating alert', err);
+    res.status(400).json({ error: 'Failed to create alert' });
+  }
+});
+
+// List alerts (requires authentication) with pagination
+app.get('/api/alerts', authenticate, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100); // Max 100 per page
+    const skip = (page - 1) * limit;
+
+    const alerts = await Alert.find()
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+    
+    const total = await Alert.countDocuments();
+
+    res.json({
+      alerts,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page * limit < total,
+        hasPrevPage: page > 1,
+      },
+    });
+  } catch (err) {
+    safeLog.error('Error fetching alerts', err);
+    res.status(500).json({ error: 'Failed to fetch alerts' });
+  }
+});
+
+// Centralized error handler middleware (must be last)
+const isDevelopment = process.env.NODE_ENV !== 'production';
+
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  
+  // Don't leak error details in production
+  const errorMessage = err.message || 'Internal server error';
+  const statusCode = err.status || err.statusCode || 500;
+  
+  // Log full error details (server-side only)
+  if (statusCode >= 500) {
+    console.error('Server error details:', {
+      message: err.message,
+      stack: err.stack,
+      path: req.path,
+      method: req.method,
+    });
+  }
+  
+  res.status(statusCode).json({
+    error: errorMessage,
+    ...(isDevelopment && { stack: err.stack }),
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// MongoDB connection configuration with connection pooling and retry logic
+const mongooseOptions = {
+  serverSelectionTimeoutMS: 10000, // 10 seconds
+  socketTimeoutMS: 45000, // 45 seconds
+  connectTimeoutMS: 10000, // 10 seconds
+  maxPoolSize: 10, // Maximum number of connections in the pool
+  minPoolSize: 5, // Minimum number of connections in the pool
+  maxIdleTimeMS: 30000, // Close connections after 30 seconds of inactivity
+  retryWrites: true, // Retry write operations on network errors
+  retryReads: true, // Retry read operations on network errors
+};
+
+// MongoDB connection event handlers
+mongoose.connection.on('connected', () => {
+  safeLog.info('MongoDB connected successfully');
+});
+
+mongoose.connection.on('error', (err) => {
+  safeLog.error('MongoDB connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  safeLog.warn('MongoDB disconnected');
+});
+
+mongoose.connection.on('reconnected', () => {
+  safeLog.info('MongoDB reconnected');
+});
+
+// Handle application termination
+process.on('SIGINT', async () => {
+  await mongoose.connection.close();
+  console.log('MongoDB connection closed through app termination');
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await mongoose.connection.close();
+  console.log('MongoDB connection closed through app termination');
+  process.exit(0);
+});
+
+// Connect to MongoDB with retry logic
+const connectWithRetry = async (retries = 5, delay = 5000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await mongoose.connect(MONGODB_URI, mongooseOptions);
+      console.log('✅ MongoDB connected');
+      
+      // Test Cloudinary connection
+      await testCloudinary();
+      
+      httpServer.listen(PORT, '0.0.0.0', () => {
+        console.log(`🚀 Backend running on http://0.0.0.0:${PORT}`);
+        console.log(`   Accessible at http://localhost:${PORT} (local)`);
+        console.log(`   Accessible at http://10.0.2.2:${PORT} (Android emulator)`);
+        console.log(`🔌 WebSocket server ready for real-time updates`);
+      });
+      return;
+    } catch (err) {
+      safeLog.error(`MongoDB connection attempt ${i + 1} failed:`, err);
+      if (i < retries - 1) {
+        console.log(`Retrying connection in ${delay / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 1.5; // Exponential backoff
+      } else {
+        console.error('❌ Failed to connect to MongoDB after', retries, 'attempts');
+        console.error('Please check your MongoDB URI and ensure MongoDB is running');
+        process.exit(1);
+      }
+    }
+  }
+};
+
+connectWithRetry();
+
+
