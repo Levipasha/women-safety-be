@@ -85,6 +85,8 @@ try {
   // Dynamic import for ES modules
   const rateLimitModule = await import('express-rate-limit');
   const rateLimit = rateLimitModule.default || rateLimitModule;
+  // Import the ipKeyGenerator helper for proper IPv6 handling
+  const { ipKeyGenerator } = rateLimitModule;
 
   // General API rate limiter (excludes emergency AND auth endpoints)
   apiLimiter = rateLimit({
@@ -141,7 +143,8 @@ try {
         return `email:${email.toLowerCase().trim()}`;
       }
       // Fallback to IP if no email provided (shouldn't happen for auth endpoints)
-      return `ip:${req.ip}`;
+      // Use ipKeyGenerator for proper IPv6 handling
+      return ipKeyGenerator(req);
     },
     // Skip rate limiting for specific conditions if needed
     skip: (req) => {
