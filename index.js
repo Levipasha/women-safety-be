@@ -86,49 +86,69 @@ try {
   const rateLimitModule = await import('express-rate-limit');
   const rateLimit = rateLimitModule.default || rateLimitModule;
 
-  // General API rate limiter (excludes emergency endpoints)
+  // General API rate limiter (excludes emergency AND auth endpoints)
   apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // 100 requests per window
+    max: 100, // 100 requests per window per IP
     message: 'Too many requests from this IP, please try again later.',
     standardHeaders: true,
     legacyHeaders: false,
-    // Skip rate limiting for critical emergency endpoints
+    // Skip rate limiting for critical emergency endpoints AND auth endpoints
     skip: (req) => {
-      // Don't rate limit emergency endpoints (SOS, alerts, etc.)
-      // req.path can be relative to mount point or full path, check both
       const fullPath = req.originalUrl || req.path;
       const relativePath = req.path;
 
-      // Emergency endpoint patterns to skip
-      const emergencyPatterns = [
+      // Patterns to skip (emergency + auth endpoints)
+      const skipPatterns = [
+        // Emergency endpoints
         'emergency/sos-broadcast',
         'emergency/upload-image',
         'emergency/upload-audio',
-        'accounts/location', // Location updates during emergencies
-        'accounts/contacts', // Contact sync (needed for emergency contacts)
+        'accounts/location',
+        'accounts/contacts',
+        // Auth endpoints (they have their own email-based rate limiting)
+        'auth/register',
+        'auth/login',
       ];
 
-      // Check if path matches any emergency pattern
-      const shouldSkip = emergencyPatterns.some(pattern => {
+      // Check if path matches any skip pattern
+      const shouldSkip = skipPatterns.some(pattern => {
         return fullPath.includes(pattern) || relativePath.includes(pattern);
       });
 
       if (shouldSkip) {
-        console.log(`[RateLimit] Skipping rate limit for emergency endpoint: ${fullPath}`);
+        console.log(`[RateLimit] Skipping general API rate limit for: ${fullPath}`);
       }
 
       return shouldSkip;
     },
   });
 
-  // Auth endpoints rate limiter (stricter)
+  // Auth endpoints rate limiter (email-based instead of IP-based)
+  // This allows unlimited users on the same IP (e.g., same WiFi network)
+  // while still protecting individual accounts from brute force attacks
   authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 5, // 5 requests per window for auth endpoints
-    message: 'Too many login attempts, please try again later.',
+    max: 5, // 5 attempts per email address (not per IP)
+    message: 'Too many login attempts for this account, please try again later.',
     standardHeaders: true,
     legacyHeaders: false,
+    // Rate limit by email instead of IP address
+    keyGenerator: (req) => {
+      // Use email from request body for login/register
+      const email = req.body?.email;
+      if (email) {
+        return `email:${email.toLowerCase().trim()}`;
+      }
+      // Fallback to IP if no email provided (shouldn't happen for auth endpoints)
+      return `ip:${req.ip}`;
+    },
+    // Skip rate limiting for specific conditions if needed
+    skip: (req) => {
+      // During development, you can skip rate limiting
+      // return process.env.NODE_ENV === 'development';
+      return false; // Keep rate limiting enabled in all environments
+    },
   });
 
   // Apply general rate limiting to all API routes
