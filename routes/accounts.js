@@ -1,9 +1,12 @@
 import express from 'express';
 import { body, param, validationResult } from 'express-validator';
 import { User } from '../models/User.js';
+import { EmergencyAlert } from '../models/EmergencyAlert.js';
 import { validateCoordinates } from '../utils/helpers.js';
 import { safeLog } from '../utils/logger.js';
 import { sendError, sendSuccess, sendValidationError } from '../utils/response.js';
+import { v2 as cloudinary } from 'cloudinary';
+import { config } from '../config/index.js';
 
 const router = express.Router();
 
@@ -24,11 +27,12 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
     [
       body('accountId').trim().notEmpty().withMessage('Account ID is required'),
       body('displayName').optional().trim(),
+      body('group').optional().isIn(['family', 'friends']).withMessage('Invalid group value'),
     ],
     validate,
     async (req, res) => {
       try {
-        const { accountId, displayName } = req.body;
+        const { accountId, displayName, group = 'family' } = req.body;
 
         // Find the child user by account ID
         const childUser = await User.findOne({ accountId: accountId.toUpperCase() });
@@ -48,6 +52,7 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
 
         // Link child to parent
         childUser.parentId = req.user._id;
+        childUser.childGroup = group;
         if (displayName) {
           childUser.displayName = displayName;
         }
@@ -61,10 +66,11 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
 
         return sendSuccess(res, {
           child: {
-            id: childUser._id,
+            id: childUser._id.toString(),
             name: childUser.name,
             accountId: childUser.accountId,
             displayName: childUser.displayName || childUser.name,
+            group: childUser.childGroup,
           },
         }, 'Child account added successfully');
       } catch (err) {
@@ -82,7 +88,7 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
       const skip = (page - 1) * limit;
 
       const children = await User.find({ parentId: req.user._id })
-        .select('name accountId displayName currentLocation updatedAt isAppEnabled activeJourney batteryLevel isCharging batteryUpdatedAt')
+        .select('name accountId displayName currentLocation updatedAt isAppEnabled activeJourney batteryLevel isCharging batteryUpdatedAt profilePicture childGroup')
         .skip(skip)
         .limit(limit)
         .lean();
@@ -101,6 +107,8 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
         batteryLevel: child.batteryLevel !== undefined ? child.batteryLevel : 100,
         isCharging: child.isCharging || false,
         batteryUpdatedAt: child.batteryUpdatedAt || null,
+        profilePicture: child.profilePicture || null,
+        group: child.childGroup || 'family',
       }));
 
       return sendSuccess(res, {
@@ -171,11 +179,13 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
       body('latitude').isFloat({ min: -90, max: 90 }).withMessage('Latitude must be between -90 and 90'),
       body('longitude').isFloat({ min: -180, max: 180 }).withMessage('Longitude must be between -180 and 180'),
       body('address').optional().trim(),
+      body('batteryLevel').optional().isInt({ min: 0, max: 100 }),
+      body('isCharging').optional().isBoolean(),
     ],
     validate,
     async (req, res) => {
       try {
-        const { latitude, longitude, address } = req.body;
+        const { latitude, longitude, address, batteryLevel, isCharging } = req.body;
 
         // Additional validation using helper
         if (!validateCoordinates(latitude, longitude)) {
@@ -188,7 +198,37 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
           address: address || null,
           timestamp: new Date(),
         };
+
+        // Update battery info if provided
+        if (batteryLevel !== undefined) {
+          req.user.batteryLevel = batteryLevel;
+          req.user.isCharging = !!isCharging;
+          req.user.batteryUpdatedAt = new Date();
+        }
+
         await req.user.save();
+
+        // LIVE SOS TRACKING: If user has an active SOS, broadcast movement to rescuers
+        try {
+          const activeAlert = await EmergencyAlert.findOne({
+            userId: req.user._id,
+            isActive: true,
+            expiresAt: { $gt: new Date() }
+          });
+
+          if (activeAlert) {
+            safeLog.info(`Victim moving - broadcasting SOS update`, { alertId: activeAlert.alertId });
+            io.to(`sos:${activeAlert.alertId}`).emit('sos-location-update', {
+              alertId: activeAlert.alertId,
+              latitude,
+              longitude,
+              address: address || req.user.currentLocation.address,
+              timestamp: req.user.currentLocation.timestamp
+            });
+          }
+        } catch (sosErr) {
+          safeLog.error('Error broadcasting SOS update', sosErr);
+        }
 
         return sendSuccess(res, {
           location: req.user.currentLocation,
@@ -338,12 +378,13 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
       body('id').trim().notEmpty().withMessage('Contact ID is required'),
       body('name').trim().notEmpty().withMessage('Contact name is required'),
       body('phone').trim().notEmpty().withMessage('Contact phone is required'),
+      body('priority').optional().isIn(['primary', 'secondary', 'none']).withMessage('Invalid priority value'),
     ],
     validate,
     async (req, res) => {
       try {
-        const { id, name, phone } = req.body;
-        safeLog.info(`[Contacts] Adding contact for user ${req.user._id}`, { id, name, phone });
+        const { id, name, phone, priority = 'none' } = req.body;
+        safeLog.info(`[Contacts] Adding contact for user ${req.user._id}`, { id, name, phone, priority });
 
         // Refresh user to get latest data
         const user = await User.findById(req.user._id);
@@ -362,14 +403,14 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
         }
 
         // Add new contact
-        user.emergencyContacts.push({ id, name, phone });
+        user.emergencyContacts.push({ id, name, phone, priority });
         safeLog.info(`[Contacts] Contact added to array, new count: ${user.emergencyContacts.length}`);
 
         await user.save();
         safeLog.info(`[Contacts] User saved successfully with new contact`);
 
         return sendSuccess(res, {
-          contact: { id, name, phone },
+          contact: { id, name, phone, priority },
         }, 'Contact added successfully');
       } catch (err) {
         safeLog.error('[Contacts] Error adding contact', err);
@@ -386,6 +427,7 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
       body('contacts.*.id').trim().notEmpty().withMessage('Each contact must have an ID'),
       body('contacts.*.name').trim().notEmpty().withMessage('Each contact must have a name'),
       body('contacts.*.phone').trim().notEmpty().withMessage('Each contact must have a phone'),
+      body('contacts.*.priority').optional().isIn(['primary', 'secondary', 'none']).withMessage('Invalid priority value'),
     ],
     validate,
     async (req, res) => {
@@ -422,13 +464,14 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
       param('contactId').notEmpty().withMessage('Contact ID is required'),
       body('name').optional().trim().notEmpty().withMessage('Contact name cannot be empty'),
       body('phone').optional().trim().notEmpty().withMessage('Contact phone cannot be empty'),
+      body('priority').optional().isIn(['primary', 'secondary', 'none']).withMessage('Invalid priority value'),
     ],
     validate,
     async (req, res) => {
       try {
         const { contactId } = req.params;
-        const { name, phone } = req.body;
-        safeLog.info(`[Contacts] Updating contact ${contactId} for user ${req.user._id}`);
+        const { name, phone, priority } = req.body;
+        safeLog.info(`[Contacts] Updating contact ${contactId} for user ${req.user._id}`, { name, phone, priority });
 
         // Refresh user to get latest data
         const user = await User.findById(req.user._id);
@@ -445,12 +488,13 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
 
         if (name !== undefined) contact.name = name;
         if (phone !== undefined) contact.phone = phone;
+        if (priority !== undefined) contact.priority = priority;
 
         await user.save();
         safeLog.info(`[Contacts] Contact ${contactId} updated successfully`);
 
         return sendSuccess(res, {
-          contact: { id: contact.id, name: contact.name, phone: contact.phone },
+          contact: { id: contact.id, name: contact.name, phone: contact.phone, priority: contact.priority },
         }, 'Contact updated successfully');
       } catch (err) {
         safeLog.error('[Contacts] Error updating contact', err);
@@ -488,6 +532,105 @@ export const createAccountRoutes = (authenticate, connectedUsers, io) => {
       } catch (err) {
         safeLog.error('[Contacts] Error deleting contact', err);
         return sendError(res, 'Failed to delete contact', 500);
+      }
+    }
+  );
+
+  // Get user phone number
+  router.get('/phone-number', authenticate, async (req, res) => {
+    try {
+      return sendSuccess(res, {
+        userPhoneNumber: req.user.userPhoneNumber || null,
+      });
+    } catch (err) {
+      safeLog.error('Error fetching phone number', err);
+      return sendError(res, 'Failed to fetch phone number', 500);
+    }
+  });
+
+
+  // Update user phone number
+  router.put('/phone-number',
+    authenticate,
+    [
+      body('phoneNumber').trim().notEmpty().withMessage('Phone number is required'),
+    ],
+    validate,
+    async (req, res) => {
+      try {
+        const { phoneNumber } = req.body;
+        safeLog.info(`[PhoneNumber] Updating phone number for user ${req.user._id}`);
+
+        req.user.userPhoneNumber = phoneNumber;
+        await req.user.save();
+
+        safeLog.info(`[PhoneNumber] Phone number updated successfully`);
+
+        return sendSuccess(res, {
+          userPhoneNumber: req.user.userPhoneNumber,
+        }, 'Phone number updated successfully');
+      } catch (err) {
+        safeLog.error('[PhoneNumber] Error updating phone number', err);
+        return sendError(res, 'Failed to update phone number', 500);
+      }
+    }
+  );
+
+  // Update profile picture
+  router.post('/profile-picture',
+    authenticate,
+    [
+      body('imageBase64').notEmpty().withMessage('Image data is required'),
+    ],
+    validate,
+    async (req, res) => {
+      try {
+        const { imageBase64 } = req.body;
+        safeLog.info(`[ProfilePicture] Updating profile picture for user ${req.user._id}`);
+
+        // Convert base64 to buffer
+        let imageBuffer;
+        try {
+          const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+          imageBuffer = Buffer.from(base64Data, 'base64');
+        } catch (error) {
+          return sendError(res, 'Invalid image data format', 400);
+        }
+
+        // Upload to Cloudinary
+        let cloudinaryResult;
+        try {
+          cloudinaryResult = await new Promise((resolve, reject) => {
+            cloudinary.uploader.upload_stream(
+              {
+                folder: 'profile-pictures',
+                resource_type: 'image',
+                public_id: `profile_${req.user._id}`,
+                overwrite: true,
+              },
+              (error, result) => {
+                if (error) reject(error);
+                else resolve(result);
+              }
+            ).end(imageBuffer);
+          });
+        } catch (error) {
+          safeLog.error('[ProfilePicture] Cloudinary upload error', error);
+          return sendError(res, 'Failed to upload image to Cloudinary', 500);
+        }
+
+        // Update user model
+        req.user.profilePicture = cloudinaryResult.secure_url;
+        await req.user.save();
+
+        safeLog.info(`[ProfilePicture] Profile picture updated successfully`);
+
+        return sendSuccess(res, {
+          profilePicture: req.user.profilePicture,
+        }, 'Profile picture updated successfully');
+      } catch (err) {
+        safeLog.error('[ProfilePicture] Error updating profile picture', err);
+        return sendError(res, 'Failed to update profile picture', 500);
       }
     }
   );

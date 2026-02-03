@@ -7,8 +7,10 @@ const userSchema = new mongoose.Schema(
     passwordHash: { type: String, required: true },
     name: { type: String, required: true, trim: true },
     accountId: { type: String, required: true, unique: true, uppercase: true },
+    profilePicture: { type: String, trim: true }, // Cloudinary URL for profile image
     displayName: { type: String, trim: true },
     parentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // If set, this user is a child
+    childGroup: { type: String, enum: ['family', 'friends'], default: 'family' }, // Group category when this user is a child
     children: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // Array of child user IDs
     currentLocation: {
       latitude: { type: Number },
@@ -53,11 +55,14 @@ const userSchema = new mongoose.Schema(
         fileSize: { type: Number }, // File size in bytes
       },
     ],
+    userPhoneNumber: { type: String, trim: true }, // User's own phone number
     emergencyContacts: [
       {
         id: { type: String, required: true }, // Frontend-generated ID
         name: { type: String, required: true, trim: true },
         phone: { type: String, required: true, trim: true },
+        priority: { type: String, enum: ['primary', 'secondary', 'none'], default: 'none' }, // Contact priority
+        group: { type: String, enum: ['family', 'friends'], default: 'family' }, // Contact group
       },
     ],
   },

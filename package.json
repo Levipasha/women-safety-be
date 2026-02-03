@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -21,6 +23,9 @@
     "mongoose": "^8.7.0",
     "morgan": "^1.10.0",
     "multer": "^2.0.2",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "expo": "~54.0.29",
+    "react": "19.1.0",
+    "react-native": "0.81.5"
   }
 }

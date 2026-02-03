@@ -20,9 +20,9 @@ import { safeLog } from './utils/logger.js';
 const app = express();
 const httpServer = createServer(app);
 
-// Trust proxy - Required for Railway/cloud deployments
-// This allows Express to trust the X-Forwarded-For header for accurate client IP detection
-app.set('trust proxy', true);
+// Trust proxy - Required for Railway/cloud deployments but problematic in local dev
+// Only enable for production to avoid express-rate-limit security errors
+app.set('trust proxy', !config.isDevelopment);
 
 // Configure Cloudinary
 cloudinary.config(config.cloudinary);
@@ -108,6 +108,9 @@ try {
         'emergency/upload-audio',
         'accounts/location',
         'accounts/contacts',
+        'accounts/children',
+        'accounts/profile-picture',
+        'journey/',
         // Auth endpoints (they have their own email-based rate limiting)
         'auth/register',
         'auth/login',
